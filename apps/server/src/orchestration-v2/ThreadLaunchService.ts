@@ -95,7 +95,14 @@ export interface ThreadLaunchInput {
 type PreparationInput = Pick<
   ThreadLaunchInput,
   "commandId" | "projectId" | "workspaceStrategy" | "initialMessage"
->;
+> & {
+  /**
+   * Set when a retry reuses the worktree its failed attempt created and
+   * recorded. Its setup is tracked like a new one, but the thread already
+   * records the workspace, and a branch rename may still be running.
+   */
+  readonly reusedWorktree?: { readonly baseRef: string };
+};
 
 export interface ThreadLaunchRetryInput {
   readonly commandId: CommandId;
@@ -233,16 +240,25 @@ const make = Effect.gen(function* () {
       ),
     );
 
-    const tracked = input.workspaceStrategy.type === "worktree";
+    const reused = input.reusedWorktree;
+    const tracked = input.workspaceStrategy.type === "worktree" || reused !== undefined;
     let createdWorktreePath: string | null = null;
     let setupTerminalId: string | null = null;
     let workspaceRecorded = false;
-    if (tracked) {
+    if (input.workspaceStrategy.type === "worktree") {
       yield* setupTracker.begin({
         threadId,
         branch: input.workspaceStrategy.branch ?? null,
         baseRef: input.workspaceStrategy.baseRef,
         stages: ["fetch", "checkout", "setup-script", "agent"],
+        fiber: yield* Effect.fiber,
+      });
+    } else if (reused !== undefined) {
+      yield* setupTracker.begin({
+        threadId,
+        branch: input.workspaceStrategy.branch ?? null,
+        baseRef: reused.baseRef,
+        stages: ["setup-script", "agent"],
         fiber: yield* Effect.fiber,
       });
     }
@@ -376,15 +392,19 @@ const make = Effect.gen(function* () {
         yield* setupTracker.stageStatus(threadId, "checkout", "done");
       }
 
-      yield* threads
-        .dispatch({
-          type: "thread.metadata.update",
-          commandId: CommandId.make(`${input.commandId}:workspace`),
-          threadId,
-          branch,
-          worktreePath,
-        })
-        .pipe(Effect.mapError(mapError(input, "update-thread", threadId)));
+      // A reused worktree is already recorded, and rewriting it could undo
+      // the first attempt's branch rename.
+      if (reused === undefined) {
+        yield* threads
+          .dispatch({
+            type: "thread.metadata.update",
+            commandId: CommandId.make(`${input.commandId}:workspace`),
+            threadId,
+            branch,
+            worktreePath,
+          })
+          .pipe(Effect.mapError(mapError(input, "update-thread", threadId)));
+      }
       workspaceRecorded = true;
 
       // Rename temporary branches (server-invented above, or sent by clients
@@ -392,6 +412,7 @@ const make = Effect.gen(function* () {
       // never delays provisioning or the provider turn. The temporary name
       // simply sticks if generation or the rename fails.
       if (
+        reused === undefined &&
         worktreePath !== null &&
         branch !== null &&
         initialMessage !== undefined &&
@@ -539,22 +560,33 @@ const make = Effect.gen(function* () {
               yield* terminals
                 .close({ threadId, terminalId: setupTerminalId, deleteHistory: true })
                 .pipe(Effect.ignore);
+            const removedPath = createdWorktreePath;
+            // The thread forgets the worktree only once it is gone; a failed
+            // removal leaves the directory for the user to clean up rather than
+            // reusing a checkout that may be half written.
             yield* git
-              .removeWorktree({
-                cwd: project.workspaceRoot,
-                path: createdWorktreePath,
-                force: true,
-              })
-              .pipe(Effect.ignore);
-            yield* threads
-              .dispatch({
-                type: "thread.metadata.update",
-                commandId: CommandId.make(`${input.commandId}:cancel-workspace`),
-                threadId,
-                worktreePath: null,
-                branch: null,
-              })
-              .pipe(Effect.ignore);
+              .removeWorktree({ cwd: project.workspaceRoot, path: removedPath, force: true })
+              .pipe(
+                Effect.andThen(
+                  threads
+                    .dispatch({
+                      type: "thread.metadata.update",
+                      commandId: CommandId.make(`${input.commandId}:cancel-workspace`),
+                      threadId,
+                      worktreePath: null,
+                      branch: null,
+                    })
+                    .pipe(Effect.ignore),
+                ),
+                Effect.catchCause((removeCause) =>
+                  Effect.logWarning("Failed to remove an abandoned thread worktree", {
+                    commandId: input.commandId,
+                    threadId,
+                    path: removedPath,
+                    cause: removeCause,
+                  }),
+                ),
+              );
           }
         }),
       ),
@@ -894,21 +926,25 @@ const make = Effect.gen(function* () {
   ) => {
     const message = projection.messages.find((candidate) => candidate.id === run.userMessageId);
     // A worktree the failed attempt already created is reused, not created again.
-    const workspaceStrategy: ThreadLaunchWorkspaceStrategy =
+    const reuse =
       workspacePreparation.type === "worktree" &&
       projection.thread.worktreePath !== null &&
       projection.thread.branch !== null
         ? {
-            type: "existing_worktree",
-            worktreePath: projection.thread.worktreePath,
-            branch: projection.thread.branch,
+            strategy: {
+              type: "existing_worktree" as const,
+              worktreePath: projection.thread.worktreePath,
+              branch: projection.thread.branch,
+            },
+            reusedWorktree: { baseRef: workspacePreparation.baseRef },
           }
-        : workspacePreparation;
+        : null;
     return schedulePreparation(
       {
         commandId: input.commandId,
         projectId: projection.thread.projectId,
-        workspaceStrategy,
+        workspaceStrategy: reuse?.strategy ?? workspacePreparation,
+        ...(reuse === null ? {} : { reusedWorktree: reuse.reusedWorktree }),
         ...(message === undefined
           ? {}
           : {
