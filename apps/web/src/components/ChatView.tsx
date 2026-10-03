@@ -1503,6 +1503,9 @@ function releaseChatTimelineAnchor<T extends { readonly messageId: MessageId | n
   return current.messageId === null ? current : { ...current, messageId: null };
 }
 
+/** Runs with a workspace preparation retry in flight, across ChatView instances. */
+const retryingWorkspacePreparationRunIds = new Set<RunId>();
+
 export default function ChatView(props: ChatViewProps) {
   const {
     environmentId,
@@ -3883,16 +3886,15 @@ export default function ChatView(props: ChatViewProps) {
     () => new Set(retryableRunIdsKey === "" ? [] : (retryableRunIdsKey.split("\n") as RunId[])),
     [retryableRunIdsKey],
   );
-  // One retry per failed run: a second click lands after the run is preparing again.
-  const retryingRunIds = useRef(new Set<RunId>());
   const onRetryWorkspacePreparation = useCallback(
     (runId: RunId) => {
-      if (!activeThreadRef || retryingRunIds.current.has(runId)) return;
-      retryingRunIds.current.add(runId);
+      // One retry per failed run: a second click lands after the run is preparing again.
+      if (!activeThreadRef || retryingWorkspacePreparationRunIds.has(runId)) return;
+      retryingWorkspacePreparationRunIds.add(runId);
       void retryWorkspacePreparation({
         environmentId: activeThreadRef.environmentId,
         input: { threadId: activeThreadRef.threadId, runId },
-      }).finally(() => retryingRunIds.current.delete(runId));
+      }).finally(() => retryingWorkspacePreparationRunIds.delete(runId));
     },
     [activeThreadRef, retryWorkspacePreparation],
   );
