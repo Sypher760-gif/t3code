@@ -11,6 +11,7 @@ import {
   legacyThreadPullRequestKey,
 } from "@t3tools/shared/threadPullRequests";
 import {
+  ORCHESTRATION_V2_WORKSPACE_PREPARATION_FAILURE_CODE,
   type ChatAttachment,
   CommandId,
   isProviderNativeSubagentThread,
@@ -386,6 +387,7 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
     case "prepared-run.release":
     case "prepared-run.progress":
     case "prepared-run.fail":
+    case "prepared-run.retry":
     case "run.interrupt":
     case "queued-message.promote-to-steer":
     case "queue.resume":
@@ -5132,6 +5134,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ...(command.restartContinuationOfRunId === undefined
             ? {}
             : { restartContinuationOfRunId: command.restartContinuationOfRunId }),
+          ...(dispatchMode.type === "defer_start" && dispatchMode.workspaceStrategy !== undefined
+            ? { workspacePreparation: dispatchMode.workspaceStrategy }
+            : {}),
           ...wakeWorkStartedAt(projection.runs, command),
         };
         const attempt: OrchestrationV2RunAttempt = {
@@ -7471,7 +7476,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     command: Extract<
       OrchestrationV2Command,
       {
-        readonly type: "prepared-run.release" | "prepared-run.progress" | "prepared-run.fail";
+        readonly type:
+          | "prepared-run.release"
+          | "prepared-run.progress"
+          | "prepared-run.fail"
+          | "prepared-run.retry";
       }
     >,
     projection: Pick<
@@ -7494,7 +7503,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         candidate.input === WORKSPACE_PREPARATION_INPUT,
     );
     if (
-      run?.status !== "preparing" ||
+      run?.status !== (command.type === "prepared-run.retry" ? "failed" : "preparing") ||
       attempt === undefined ||
       rootNode === undefined ||
       providerThread === undefined ||
@@ -7712,7 +7721,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           completedAt: now,
           updatedAt: now,
           type: "error",
-          failure: command.failure,
+          failure: {
+            ...command.failure,
+            code: ORCHESTRATION_V2_WORKSPACE_PREPARATION_FAILURE_CODE,
+          },
         },
       });
       yield* emitEvent({
@@ -7723,6 +7735,90 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         providerInstanceId: state.run.providerInstanceId,
         occurredAt: now,
         payload: { ...state.run, status: "failed", completedAt: now },
+      });
+    });
+
+  /**
+   * Returns a run whose workspace preparation failed to preparing. The failure
+   * item turns cancelled so clients stop offering the retry; ThreadLaunchService
+   * runs the recorded preparation again once this commits.
+   */
+  const dispatchPreparedRunRetry = (
+    command: Extract<OrchestrationV2Command, { readonly type: "prepared-run.retry" }>,
+    events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+  ) =>
+    Effect.gen(function* () {
+      const projection = yield* loadProjectionForCommand(
+        command,
+        ["runs", "attempts", "nodes", "providerThreads", "turnItems"],
+        { turnItemTypes: ["command_execution", "error"], turnItemRunId: command.runId },
+      );
+      const state = preparedRunState(command, projection);
+      const failureItem = projection.turnItems.find(
+        (candidate): candidate is Extract<OrchestrationV2TurnItem, { readonly type: "error" }> =>
+          candidate.type === "error" &&
+          candidate.status === "failed" &&
+          candidate.failure.code === ORCHESTRATION_V2_WORKSPACE_PREPARATION_FAILURE_CODE,
+      );
+      if (
+        state === null ||
+        state.run.workspacePreparation === undefined ||
+        failureItem === undefined ||
+        projection.thread.archivedAt !== null ||
+        projection.thread.deletedAt !== null
+      ) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: `Run ${command.runId} has no failed workspace preparation to retry.`,
+        });
+      }
+      if (projection.runs.some((run) => run.id !== state.run.id && isBlockingRun(run))) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: "Another run is active on this thread.",
+        });
+      }
+      const now = yield* DateTime.now;
+      const emitEvent = emit(events, command);
+      const scope = {
+        threadId: command.threadId,
+        runId: state.run.id,
+        nodeId: state.rootNode.id,
+        providerInstanceId: state.run.providerInstanceId,
+        occurredAt: now,
+      };
+      yield* emitEvent({
+        ...scope,
+        type: "turn-item.updated",
+        payload: { ...failureItem, status: "cancelled", updatedAt: now },
+      });
+      yield* emitEvent({
+        ...scope,
+        type: "turn-item.updated",
+        payload: {
+          ...state.preparationItem,
+          status: "running",
+          title: WORKSPACE_PREPARATION_INPUT,
+          completedAt: null,
+          updatedAt: now,
+        },
+      });
+      yield* emitEvent({
+        ...scope,
+        type: "run-attempt.updated",
+        payload: { ...state.attempt, status: "pending", completedAt: null },
+      });
+      yield* emitEvent({
+        ...scope,
+        type: "node.updated",
+        payload: { ...state.rootNode, status: "pending", completedAt: null },
+      });
+      yield* emitEvent({
+        ...scope,
+        type: "run.updated",
+        payload: { ...state.run, status: "preparing", completedAt: null },
       });
     });
 
@@ -9322,6 +9418,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         break;
       case "prepared-run.fail":
         yield* dispatchPreparedRunFail(command, events);
+        break;
+      case "prepared-run.retry":
+        yield* dispatchPreparedRunRetry(command, events);
         break;
       case "runtime-request.respond":
         yield* dispatchRuntimeRequestRespond(command, events, effects);
