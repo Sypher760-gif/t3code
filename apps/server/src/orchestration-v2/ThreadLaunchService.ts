@@ -236,6 +236,7 @@ const make = Effect.gen(function* () {
     const tracked = input.workspaceStrategy.type === "worktree";
     let createdWorktreePath: string | null = null;
     let setupTerminalId: string | null = null;
+    let workspaceRecorded = false;
     if (tracked) {
       yield* setupTracker.begin({
         threadId,
@@ -384,6 +385,7 @@ const make = Effect.gen(function* () {
           worktreePath,
         })
         .pipe(Effect.mapError(mapError(input, "update-thread", threadId)));
+      workspaceRecorded = true;
 
       // Rename temporary branches (server-invented above, or sent by clients
       // that name worktrees themselves) in the background so generation latency
@@ -529,7 +531,10 @@ const make = Effect.gen(function* () {
             cancelled ? "cancelled" : "failed",
             cancelled ? null : failureDetail(Cause.squash(cause)),
           );
-          if (cancelled && tracked && createdWorktreePath) {
+          // A cancelled setup leaves nothing behind. A failed one keeps a worktree
+          // the thread recorded, so a retry reuses it, and removes one it never
+          // recorded, which a retry would otherwise duplicate.
+          if (tracked && createdWorktreePath && (cancelled || !workspaceRecorded)) {
             if (setupTerminalId)
               yield* terminals
                 .close({ threadId, terminalId: setupTerminalId, deleteHistory: true })
@@ -557,7 +562,7 @@ const make = Effect.gen(function* () {
   });
 
   const failPreparedRun = (
-    input: PreparationInput,
+    input: Pick<PreparationInput, "commandId">,
     threadId: ThreadId,
     runId: RunId | null,
     cause: unknown,
@@ -582,7 +587,6 @@ const make = Effect.gen(function* () {
             }),
           })
           .pipe(
-            Effect.mapError(mapError(input, "fail-run", threadId)),
             Effect.catchCause((persistCause) =>
               Effect.logWarning("Failed to persist thread workspace preparation failure", {
                 commandId: input.commandId,
@@ -864,14 +868,34 @@ const make = Effect.gen(function* () {
     });
     // A replayed retry finds the run already past preparation, or prepared by
     // the attempt that first reserved this command.
-    const projection = yield* threads.getThreadProjection(input.threadId);
-    const run = projection.runs.find((candidate) => candidate.id === input.runId);
-    const message = projection.messages.find((candidate) => candidate.id === run?.userMessageId);
-    if (run?.status !== "preparing" || run.workspacePreparation === undefined) return dispatched;
-    if (!(yield* reservePreparation(input.commandId))) return dispatched;
+    // From here the run is preparing again; anything that stops preparation
+    // from being scheduled must fail it, or it would wait in preparing forever.
+    const scheduled = yield* Effect.gen(function* () {
+      const projection = yield* threads.getThreadProjection(input.threadId);
+      const run = projection.runs.find((candidate) => candidate.id === input.runId);
+      const workspacePreparation = run?.workspacePreparation;
+      if (run?.status !== "preparing" || workspacePreparation === undefined) return;
+      if (!(yield* reservePreparation(input.commandId))) return;
+      yield* scheduleRetriedPreparation(input, projection, run, workspacePreparation).pipe(
+        Effect.onError(() => releasePreparation(input.commandId)),
+      );
+    }).pipe(Effect.exit);
+    if (Exit.isFailure(scheduled)) {
+      yield* failPreparedRun(input, input.threadId, input.runId, Cause.squash(scheduled.cause));
+    }
+    return dispatched;
+  });
+
+  const scheduleRetriedPreparation = (
+    input: ThreadLaunchRetryInput,
+    projection: OrchestrationV2ThreadProjection,
+    run: OrchestrationV2ThreadProjection["runs"][number],
+    workspacePreparation: ThreadLaunchWorkspaceStrategy,
+  ) => {
+    const message = projection.messages.find((candidate) => candidate.id === run.userMessageId);
     // A worktree the failed attempt already created is reused, not created again.
     const workspaceStrategy: ThreadLaunchWorkspaceStrategy =
-      run.workspacePreparation.type === "worktree" &&
+      workspacePreparation.type === "worktree" &&
       projection.thread.worktreePath !== null &&
       projection.thread.branch !== null
         ? {
@@ -879,8 +903,8 @@ const make = Effect.gen(function* () {
             worktreePath: projection.thread.worktreePath,
             branch: projection.thread.branch,
           }
-        : run.workspacePreparation;
-    yield* schedulePreparation(
+        : workspacePreparation;
+    return schedulePreparation(
       {
         commandId: input.commandId,
         projectId: projection.thread.projectId,
@@ -897,9 +921,8 @@ const make = Effect.gen(function* () {
       },
       input.threadId,
       run.id,
-    ).pipe(Effect.onError(() => releasePreparation(input.commandId)));
-    return dispatched;
-  });
+    );
+  };
 
   return ThreadLaunchService.of({ launch, retryPreparation });
 });

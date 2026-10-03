@@ -3883,13 +3883,16 @@ export default function ChatView(props: ChatViewProps) {
     () => new Set(retryableRunIdsKey === "" ? [] : (retryableRunIdsKey.split("\n") as RunId[])),
     [retryableRunIdsKey],
   );
+  // One retry per failed run: a second click lands after the run is preparing again.
+  const retryingRunIds = useRef(new Set<RunId>());
   const onRetryWorkspacePreparation = useCallback(
     (runId: RunId) => {
-      if (!activeThreadRef) return;
+      if (!activeThreadRef || retryingRunIds.current.has(runId)) return;
+      retryingRunIds.current.add(runId);
       void retryWorkspacePreparation({
         environmentId: activeThreadRef.environmentId,
         input: { threadId: activeThreadRef.threadId, runId },
-      });
+      }).finally(() => retryingRunIds.current.delete(runId));
     },
     [activeThreadRef, retryWorkspacePreparation],
   );
