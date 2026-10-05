@@ -786,6 +786,13 @@ function timelineEntryStartsResponse(entry: TimelineEntry): boolean {
   );
 }
 
+/** The run a response boundary (prompt or automatic-wake notification) belongs to. */
+function responseBoundaryRunId(entry: TimelineEntry): RunId | null {
+  if (entry.kind === "message") return entry.message.runId ?? null;
+  if (entry.kind === "work") return entry.entry.runId ?? null;
+  return null;
+}
+
 /**
  * A promptless provider restart replaces the native turn without adding a
  * user message. Keep every provider turn since the initiating prompt in one
@@ -898,29 +905,41 @@ function deriveTurnFolds(input: {
   // first V2 run must not unfold every imported turn above it.
   let runlessKey: RunId | null = null;
   let pendingBoundary: { createdAt: string; anchorEntryId: string } | null = null;
+  // A sub-agent continued by a later turn keeps its place in the turn that
+  // started it but takes the later run's id. It folds with the turn it sits
+  // in, or the later turn's fold would open above its own prompt.
+  const promptIndexByRunId = new Map<RunId, number>();
+  for (const [index, entry] of input.timelineEntries.entries()) {
+    if (!timelineEntryStartsResponse(entry)) continue;
+    const boundaryRunId = responseBoundaryRunId(entry);
+    if (boundaryRunId !== null && !promptIndexByRunId.has(boundaryRunId)) {
+      promptIndexByRunId.set(boundaryRunId, index);
+    }
+  }
+  let promptRunId: RunId | null = null;
   for (const [index, entry] of input.timelineEntries.entries()) {
     if (timelineEntryStartsResponse(entry)) {
       const nextEntry = input.timelineEntries[index + 1];
       pendingBoundary = nextEntry
         ? { createdAt: entry.createdAt, anchorEntryId: nextEntry.id }
         : null;
-      const boundaryRunId =
-        entry.kind === "message"
-          ? entry.message.runId
-          : entry.kind === "work"
-            ? entry.entry.runId
-            : null;
+      const boundaryRunId = responseBoundaryRunId(entry);
       runlessKey = boundaryRunId == null ? RunId.make(`runless:${entry.id}`) : null;
+      promptRunId = boundaryRunId;
       continue;
     }
     const runId = timelineEntryFoldRunId(entry, runlessKey);
     if (!runId) {
       continue;
     }
-    if (runId === runlessKey && timelineEntryFailedItem(entry) !== null) {
-      runlessFailedKeys.add(runId);
+    // An entry that sits before its own run's prompt (a continued sub-agent)
+    // folds with the turn it sits in, keyed by the run of that prompt.
+    const foldRunId =
+      promptRunId !== null && (promptIndexByRunId.get(runId) ?? -1) > index ? promptRunId : runId;
+    if (foldRunId === runlessKey && timelineEntryFailedItem(entry) !== null) {
+      runlessFailedKeys.add(foldRunId);
     }
-    let group = groupsByRunId.get(runId);
+    let group = groupsByRunId.get(foldRunId);
     if (!group) {
       group = {
         entries: [],
@@ -933,7 +952,7 @@ function deriveTurnFolds(input: {
         anchorEntryId: pendingBoundary?.anchorEntryId ?? entry.id,
       };
       pendingBoundary = null;
-      groupsByRunId.set(runId, group);
+      groupsByRunId.set(foldRunId, group);
     }
     group.entries.push(entry);
     if (entry.kind === "message") {
