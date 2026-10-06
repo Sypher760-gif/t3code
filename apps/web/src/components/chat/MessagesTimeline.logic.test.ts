@@ -3787,6 +3787,117 @@ describe("v2 run and attempt history", () => {
       run2,
     ]);
   });
+  it("keeps a failed run's continued sub-agent visible inside an earlier fold", () => {
+    const run1 = RunId.make("run-1");
+    const run2 = RunId.make("run-2");
+    // Same shape as the test above, but run 2 failed. Failed runs stay
+    // unfolded, so the continued sub-agent — which folds with turn 1 —
+    // must not disappear inside turn 1's collapsed fold.
+    const timelineEntries = [
+      {
+        id: "prompt-1",
+        kind: "message" as const,
+        createdAt: "2026-01-01T00:00:00Z",
+        message: {
+          id: MessageId.make("prompt-1"),
+          role: "user" as const,
+          text: "Spawn a subagent",
+          runId: run1,
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+          streaming: false,
+        },
+      },
+      {
+        id: "continued-subagent",
+        kind: "event" as const,
+        createdAt: "2026-01-01T00:00:03Z",
+        projectedItem: {
+          item: {
+            type: "subagent",
+            runId: run2,
+          },
+        },
+      } as never,
+      {
+        id: "answer-1",
+        kind: "message" as const,
+        createdAt: "2026-01-01T00:00:20Z",
+        message: {
+          id: MessageId.make("answer-1"),
+          role: "assistant" as const,
+          text: "Subagent started.",
+          runId: run1,
+          createdAt: "2026-01-01T00:00:20Z",
+          updatedAt: "2026-01-01T00:00:22Z",
+          streaming: false,
+        },
+      },
+      {
+        id: "prompt-2",
+        kind: "message" as const,
+        createdAt: "2026-01-01T00:01:00Z",
+        message: {
+          id: MessageId.make("prompt-2"),
+          role: "user" as const,
+          text: "Continue the subagent",
+          runId: run2,
+          createdAt: "2026-01-01T00:01:00Z",
+          updatedAt: "2026-01-01T00:01:00Z",
+          streaming: false,
+        },
+      },
+      {
+        id: "work-2",
+        kind: "work" as const,
+        createdAt: "2026-01-01T00:01:05Z",
+        entry: {
+          id: "work-2",
+          runId: run2,
+          createdAt: "2026-01-01T00:01:05Z",
+          label: "Running command",
+          tone: "tool" as const,
+          toolLifecycleStatus: "completed" as const,
+        },
+      },
+      {
+        id: "answer-2",
+        kind: "message" as const,
+        createdAt: "2026-01-01T00:01:20Z",
+        message: {
+          id: MessageId.make("answer-2"),
+          role: "assistant" as const,
+          text: "Done.",
+          runId: run2,
+          createdAt: "2026-01-01T00:01:20Z",
+          updatedAt: "2026-01-01T00:01:22Z",
+          streaming: false,
+        },
+      },
+    ];
+
+    const rows = deriveMessagesTimelineRows({
+      timelineEntries,
+      latestRun: {
+        runId: run2,
+        status: "failed" as const,
+        startedAt: "2026-01-01T00:01:00Z",
+        completedAt: "2026-01-01T00:01:30Z",
+      },
+      isWorking: false,
+      turnDiffSummaries: [],
+      supportsConversationRollback: false,
+    });
+
+    expect(rows.map((row) => row.id)).toEqual([
+      "prompt-1",
+      "continued-subagent",
+      "answer-1",
+      "prompt-2",
+      "work-2",
+      "answer-2",
+    ]);
+  });
   it("does not move the fold of an ordinary single-run turn", () => {
     const run1 = RunId.make("run-1");
     const timelineEntries = [

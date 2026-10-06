@@ -986,6 +986,11 @@ function deriveTurnFolds(input: {
       if (entry.id === group.terminalEntry?.id) {
         continue;
       }
+      // An entry re-keyed into an earlier turn's fold keeps its own run's visibility.
+      const originalRunId = timelineEntryFoldRunId(entry, null);
+      if (originalRunId !== null && input.unfoldedRunIds.has(originalRunId)) {
+        continue;
+      }
       const isCompaction =
         entry.kind === "work" && entry.entry.sourceActivityKind === "context-compaction";
       const isFoldableTrailingActivity =
