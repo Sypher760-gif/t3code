@@ -10,6 +10,7 @@ import { ThreadId } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import * as ServerConfig from "../config.ts";
@@ -193,6 +194,122 @@ it.effect("starts fresh without V1 and never imports over existing V2 state", ()
     Effect.provide(
       ServerConfig.layerTest(directory, directory).pipe(Layer.provideMerge(NodeServices.layer)),
     ),
+    Effect.ensuring(Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true }))),
+  );
+});
+
+it.effect("warns when an existing statev2.sqlite is an older snapshot than state.sqlite", () => {
+  const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-v2-stale-"));
+  const sourcePath = NodePath.join(directory, "state.sqlite");
+  const destinationPath = NodePath.join(directory, "statev2.sqlite");
+  const insertEvents = (filename: string, start: number, count: number) =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      for (let index = start; index < start + count; index++) {
+        yield* sql`INSERT INTO orchestration_events (event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at, actor_kind, payload_json, metadata_json)
+        VALUES (${`event-${index}`}, 'thread', ${`thread-${index}`}, 0, 'thread.created', '2026-01-01T00:00:00.000Z', 'server', '{}', '{}')`;
+      }
+    }).pipe(Effect.provide(NodeSqliteClient.layer({ filename })));
+  const migrate = Effect.gen(function* () {
+    yield* runMigrations({ toMigrationInclusive: 52 });
+  }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: sourcePath })));
+
+  return Effect.gen(function* () {
+    yield* migrate;
+    yield* insertEvents(sourcePath, 0, 3);
+    yield* initializeV2Database(destinationPath);
+    const destinationBefore = NodeFS.readFileSync(destinationPath);
+    yield* insertEvents(sourcePath, 3, 3);
+    const sourceBefore = NodeFS.readFileSync(sourcePath);
+    const logs: Array<string> = [];
+    const logger = Logger.make(({ message }) => {
+      const parts = Array.isArray(message) ? message : [message];
+      logs.push(parts.map(String).join(" "));
+    });
+    yield* initializeV2Database(destinationPath).pipe(
+      Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+    );
+    assert.isTrue(logs.some((line) => line.includes("statev2.sqlite")));
+    assert.deepEqual(NodeFS.readFileSync(sourcePath), sourceBefore);
+    assert.deepEqual(NodeFS.readFileSync(destinationPath), destinationBefore);
+  }).pipe(
+    Effect.provide(NodeServices.layer),
+    Effect.ensuring(Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true }))),
+  );
+});
+
+it.effect("does not warn when statev2.sqlite is current with state.sqlite", () => {
+  const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-v2-current-"));
+  const sourcePath = NodePath.join(directory, "state.sqlite");
+  const destinationPath = NodePath.join(directory, "statev2.sqlite");
+  const migrate = Effect.gen(function* () {
+    yield* runMigrations({ toMigrationInclusive: 52 });
+    const sql = yield* SqlClient.SqlClient;
+    for (let index = 0; index < 3; index++) {
+      yield* sql`INSERT INTO orchestration_events (event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at, actor_kind, payload_json, metadata_json)
+      VALUES (${`event-${index}`}, 'thread', ${`thread-${index}`}, 0, 'thread.created', '2026-01-01T00:00:00.000Z', 'server', '{}', '{}')`;
+    }
+  }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: sourcePath })));
+
+  return Effect.gen(function* () {
+    yield* migrate;
+    yield* initializeV2Database(destinationPath);
+    const logs: Array<string> = [];
+    const logger = Logger.make(({ message }) => {
+      const parts = Array.isArray(message) ? message : [message];
+      logs.push(parts.map(String).join(" "));
+    });
+    yield* initializeV2Database(destinationPath).pipe(
+      Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+    );
+    assert.deepEqual(logs, []);
+  }).pipe(
+    Effect.provide(NodeServices.layer),
+    Effect.ensuring(Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true }))),
+  );
+});
+
+it.effect("ignores V2 events when comparing a migrated statev2.sqlite against state.sqlite", () => {
+  const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-v2-migrated-"));
+  const sourcePath = NodePath.join(directory, "state.sqlite");
+  const destinationPath = NodePath.join(directory, "statev2.sqlite");
+  const insertEvents = (filename: string, start: number, count: number) =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      for (let index = start; index < start + count; index++) {
+        yield* sql`INSERT INTO orchestration_events (event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at, actor_kind, payload_json, metadata_json)
+        VALUES (${`event-${index}`}, 'thread', ${`thread-${index}`}, 0, 'thread.created', '2026-01-01T00:00:00.000Z', 'server', '{}', '{}')`;
+      }
+    }).pipe(Effect.provide(NodeSqliteClient.layer({ filename })));
+  const migrate = Effect.gen(function* () {
+    yield* runMigrations({ toMigrationInclusive: 52 });
+  }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: sourcePath })));
+  const simulateMigratedV2 = Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`ALTER TABLE orchestration_events ADD COLUMN application_event_version INTEGER NOT NULL DEFAULT 1`;
+    for (let index = 0; index < 5; index++) {
+      yield* sql`INSERT INTO orchestration_events (event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at, actor_kind, payload_json, metadata_json, application_event_version)
+      VALUES (${`v2-event-${index}`}, 'thread', ${`v2-thread-${index}`}, 0, 'thread.created', '2026-01-01T00:00:00.000Z', 'server', '{}', '{}', 2)`;
+    }
+  }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: destinationPath })));
+
+  return Effect.gen(function* () {
+    yield* migrate;
+    yield* insertEvents(sourcePath, 0, 3);
+    yield* initializeV2Database(destinationPath);
+    yield* simulateMigratedV2;
+    yield* insertEvents(sourcePath, 3, 3);
+    const logs: Array<string> = [];
+    const logger = Logger.make(({ message }) => {
+      const parts = Array.isArray(message) ? message : [message];
+      logs.push(parts.map(String).join(" "));
+    });
+    yield* initializeV2Database(destinationPath).pipe(
+      Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+    );
+    assert.isTrue(logs.some((line) => line.includes("statev2.sqlite")));
+  }).pipe(
+    Effect.provide(NodeServices.layer),
     Effect.ensuring(Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true }))),
   );
 });
